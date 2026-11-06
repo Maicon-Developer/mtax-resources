@@ -32,7 +32,7 @@ local Handlers = {}
 local BuildPlayerRecord, BuildPlayerList, BuildResourceList, findResource, resourceIsRunning
 local QueryBans, QueryAclGroups, QueryServerSettings
 local BroadcastPlayers, BroadcastResources, BroadcastBans, BroadcastAclGroups, BroadcastServerSettings, BroadcastActionLog
-local AddBanRecord, getPlayerSerial, getPlayerAccountName, getPlayerGroups, getPlayerAcDetected, todayString, PushActionLog
+local getPlayerSerial, getPlayerAccountName, getPlayerGroups, getPlayerAcDetected, PushActionLog
 
 local function isAdmin(player)
 	if not player or not isElement(player) or getElementType(player) ~= 'player' then
@@ -148,14 +148,6 @@ getPlayerAcDetected = function(player)
 	return table.concat(names, ', ')
 end
 
-todayString = function()
-	local ok, t = pcall(getRealTime)
-	if ok and type(t) == 'table' then
-		return string.format('%04d-%02d-%02d', (t.year or 0) + 1900, (t.month or 0) + 1, t.monthday or 1)
-	end
-	return 'N/A'
-end
-
 BuildPlayerRecord = function(player)
 	local x, y, z = getElementPosition(player)
 	local weaponId = getPedWeapon and getPedWeapon(player) or 0
@@ -248,13 +240,51 @@ BuildResourceList = function()
 	return list
 end
 
-QueryBans = function()
-	local q = dbQuery(DB, 'SELECT * FROM bans ORDER BY id DESC LIMIT 200')
-	local rows = dbPoll(q, -1) or {}
-	local list = {}
-	for _, row in ipairs(rows) do
-		list[#list + 1] = { id = row.id, name = row.name, ip = row.ip, serial = row.serial, by = row.admin, date = row.date }
+-- The `bans` resource is the single authoritative ban store (bans.db); the panel
+-- is only a view/controller over its exports. This avoids a second, conflicting
+-- ban table that would drift from the records the server actually enforces.
+local function formatBanDate(timestamp)
+	local seconds = tonumber(timestamp)
+	if not seconds or seconds <= 0 then return 'N/A' end
+	local ok, t = pcall(getRealTime, seconds)
+	if ok and type(t) == 'table' then
+		return string.format('%04d-%02d-%02d', (t.year or 0) + 1900, (t.month or 0) + 1, t.monthday or 1)
 	end
+	return 'N/A'
+end
+
+local function banRecordToRow(record)
+	return {
+		id = record.id,
+		name = (type(record.nick) == 'string' and record.nick ~= '') and record.nick or 'N/A',
+		ip = (type(record.ip) == 'string' and record.ip ~= '') and record.ip or 'N/A',
+		serial = (type(record.serial) == 'string' and record.serial ~= '') and record.serial or 'N/A',
+		by = (type(record.admin) == 'string' and record.admin ~= '') and record.admin or 'Console',
+		date = formatBanDate(record.banTime),
+	}
+end
+
+local function fetchBanRecords()
+	local ok, records = pcall(function() return exports['bans']:getBans() end)
+	if not ok or type(records) ~= 'table' then return {} end
+	return records
+end
+
+local function findBanRecord(id)
+	id = tonumber(id)
+	if not id then return nil end
+	for _, record in ipairs(fetchBanRecords()) do
+		if record.id == id then return record end
+	end
+	return nil
+end
+
+QueryBans = function()
+	local list = {}
+	for _, record in ipairs(fetchBanRecords()) do
+		list[#list + 1] = banRecordToRow(record)
+	end
+	table.sort(list, function(a, b) return a.id > b.id end)
 	return list
 end
 
@@ -290,31 +320,6 @@ QueryAclGroups = function()
 	end
 	table.sort(list, function(a, b) return a.name < b.name end)
 	return list
-end
-
-AddBanRecord = function(name, ip, serial, admin, reason)
-	dbExec(DB, 'INSERT INTO bans (name, ip, serial, reason, admin, date) VALUES (?, ?, ?, ?, ?, ?)',
-		name, ip, serial, reason, getPlayerName(admin), todayString())
-end
-
-local function getBanById(id)
-	local q = dbQuery(DB, 'SELECT * FROM bans WHERE id = ?', id)
-	local rows = dbPoll(q, -1) or {}
-	return rows[1]
-end
-
-local function isIpBanned(ip)
-	if not ip or ip == '' then return false end
-	local q = dbQuery(DB, "SELECT id FROM bans WHERE ip = ? AND ip NOT IN ('N/A', 'liberado', '') LIMIT 1", ip)
-	local rows = dbPoll(q, -1) or {}
-	return rows[1] ~= nil
-end
-
-local function isSerialBanned(serial)
-	if not serial or serial == '' then return false end
-	local q = dbQuery(DB, "SELECT id FROM bans WHERE serial = ? AND serial NOT IN ('N/A', 'liberado', '') LIMIT 1", serial)
-	local rows = dbPoll(q, -1) or {}
-	return rows[1] ~= nil
 end
 
 local function broadcastToOpenAdmins(eventName, payload)
@@ -361,9 +366,12 @@ function Handlers.moderatePlayer(admin, data)
 	if data.action == 'kick' then
 		kickPlayer(target, admin, 'Kicked by the admin panel')
 	elseif data.action == 'ban' then
-		AddBanRecord(getPlayerName(target), getPlayerIP(target) or 'N/A', getPlayerSerial(target), admin, 'Banned by the admin panel')
+		-- banPlayer (by IP + serial) records the ban in the authoritative store and kicks the target.
+		local banOk, record = pcall(function() return exports['bans']:banPlayer(target, true, false, true, admin, 'Banned by the admin panel') end)
+		if not banOk or not record then
+			kickPlayer(target, admin, 'Banned by the admin panel')
+		end
 		BroadcastBans()
-		kickPlayer(target, admin, 'Banned by the admin panel')
 	elseif data.action == 'mute' then
 		setPlayerMuted(target, not isPlayerMuted(target))
 	elseif data.action == 'freeze' then
@@ -398,9 +406,7 @@ function Handlers.shoutPlayer(admin, data)
 	local target = PlayerRegistryById[data.id]
 	if not target then return { ok = false, message = 'Player not found.' } end
 	ShoutTarget[admin] = target
-	if outputChatBox then
-		outputChatBox('Your next message will be sent as SHOUT to ' .. getPlayerName(target), admin)
-	end
+	pcall(function() exports['chat']:outputChatBox('Your next message will be sent as SHOUT to ' .. getPlayerName(target), admin) end)
 	return { ok = true, message = 'Shout mode enabled for ' .. getPlayerName(target) }
 end
 
@@ -742,10 +748,10 @@ function Handlers.setFpsLimit(admin, data)
 end
 
 function Handlers.sendWelcomeMessage(admin, data)
-	if not outputChatBox then return { ok = false, message = 'outputChatBox unavailable in this build.' } end
-	for _, player in ipairs(getElementsByType('player')) do
-		outputChatBox(tostring(data.message or ''), player)
-	end
+	-- Route through the chat resource so messages reach its custom chat UI and 3D labels.
+	local ok, delivered = pcall(function() return exports['chat']:outputChatBox(tostring(data.message or ''), root) end)
+	if not ok then return { ok = false, message = "Failed to communicate with the 'chat' resource (is it running?)." } end
+	if not delivered then return { ok = false, message = 'Message could not be delivered.' } end
 	return { ok = true, message = 'Message sent.' }
 end
 
@@ -755,53 +761,81 @@ function Handlers.shutdownServer(admin, data)
 end
 
 function Handlers.clearChat(admin, data)
-	if not outputChatBox then return { ok = false, message = 'outputChatBox unavailable in this build.' } end
-	for _, player in ipairs(getElementsByType('player')) do
-		for _ = 1, 30 do
-			outputChatBox('', player)
-		end
-	end
+	-- The chat resource's clearChat sends the clear action that resets history and 3D labels;
+	-- emitting blank lines would not clear either.
+	local ok, cleared = pcall(function() return exports['chat']:clearChat(root) end)
+	if not ok then return { ok = false, message = "Failed to communicate with the 'chat' resource (is it running?)." } end
+	if not cleared then return { ok = false, message = 'Chat could not be cleared.' } end
 	return { ok = true, message = 'Chat cleared.' }
 end
 
 function Handlers.searchBans(admin, data)
-	local column = data.type == 'IP' and 'ip' or (data.type == 'Serial' and 'serial' or 'name')
-	local q = dbQuery(DB, 'SELECT * FROM bans WHERE ' .. column .. ' LIKE ? ORDER BY id DESC LIMIT 200', '%' .. tostring(data.query or '') .. '%')
-	local rows = dbPoll(q, -1) or {}
+	local field = data.type == 'IP' and 'ip' or (data.type == 'Serial' and 'serial' or 'name')
+	-- Match as a literal substring. A plain find avoids the SQL LIKE wildcards (`%`, `_`)
+	-- that would otherwise let a query match unrelated records or every ban.
+	local query = tostring(data.query or ''):lower()
 	local list = {}
-	for _, row in ipairs(rows) do
-		list[#list + 1] = { id = row.id, name = row.name, ip = row.ip, serial = row.serial, by = row.admin, date = row.date }
+	for _, record in ipairs(fetchBanRecords()) do
+		local row = banRecordToRow(record)
+		if query == '' or tostring(row[field]):lower():find(query, 1, true) then
+			list[#list + 1] = row
+		end
 	end
+	table.sort(list, function(a, b) return a.id > b.id end)
 	return list
 end
 
 function Handlers.banRowAction(admin, data)
-	local row = getBanById(data.id)
-	if not row then return { ok = false, message = 'Ban record not found.' } end
+	local record = findBanRecord(data.id)
+	if not record then return { ok = false, message = 'Ban record not found.' } end
 
 	if data.action == 'details' then
-		return { ok = true, message = string.format('%s — IP %s — Serial %s — banned by %s on %s', row.name, row.ip, row.serial, row.admin, row.date) }
-	elseif data.action == 'unban' then
-		dbExec(DB, 'DELETE FROM bans WHERE id = ?', data.id)
+		local row = banRecordToRow(record)
+		return { ok = true, message = string.format('%s — IP %s — Serial %s — banned by %s on %s', row.name, row.ip, row.serial, row.by, row.date) }
+	end
+
+	local ok, result
+	if data.action == 'unban' then
+		ok, result = pcall(function() return exports['bans']:removeBan({ id = record.id }, admin) end)
 	elseif data.action == 'unbanIp' then
-		dbExec(DB, "UPDATE bans SET ip = 'liberado' WHERE id = ?", data.id)
+		ok, result = pcall(function() return exports['bans']:clearBanIP({ id = record.id }) end)
 	elseif data.action == 'unbanSerial' then
-		dbExec(DB, "UPDATE bans SET serial = 'liberado' WHERE id = ?", data.id)
+		ok, result = pcall(function() return exports['bans']:clearBanSerial({ id = record.id }) end)
 	else
 		return { ok = false, message = 'Unknown ban action.' }
 	end
+
+	if not ok then return { ok = false, message = "Failed to communicate with the 'bans' resource (is it running?)." } end
+	if result == false then return { ok = false, message = data.action .. ' failed.' } end
 
 	BroadcastBans()
 	return { ok = true, message = data.action .. ' applied.' }
 end
 
 function Handlers.banByField(admin, data)
-	local row = getBanById(data.id)
-	if not row then return { ok = false, message = 'Record not found.' } end
-	local value = data.field == 'ip' and row.ip or row.serial
-	AddBanRecord(row.name, data.field == 'ip' and value or 'N/A', data.field == 'serial' and value or 'N/A', admin, 'Ban by ' .. tostring(data.field) .. ' from the panel')
+	local field = data.field
+	if field ~= 'ip' and field ~= 'serial' then return { ok = false, message = 'Unknown ban field.' } end
+
+	local record = findBanRecord(data.id)
+	if not record then return { ok = false, message = 'Record not found.' } end
+
+	-- Reject missing/released identifiers: a blank or "N/A" value can never block anyone.
+	local value = field == 'ip' and record.ip or record.serial
+	if type(value) ~= 'string' or value == '' or value == 'N/A' then
+		return { ok = false, message = 'This record has no ' .. field .. ' to ban.' }
+	end
+
+	local ok, result = pcall(function()
+		if field == 'ip' then
+			return exports['bans']:addBan(value, nil, nil, admin, 'Ban by IP from the admin panel')
+		end
+		return exports['bans']:addBan(nil, nil, value, admin, 'Ban by serial from the admin panel')
+	end)
+	if not ok then return { ok = false, message = "Failed to communicate with the 'bans' resource (is it running?)." } end
+	if not result then return { ok = false, message = 'Could not create the ban.' } end
+
 	BroadcastBans()
-	return { ok = true, message = tostring(data.field) .. ' banned.' }
+	return { ok = true, message = field .. ' banned.' }
 end
 
 function Handlers.refreshBans(admin, data)
@@ -850,7 +884,7 @@ addEvent('mtax:admin:requestToggle', true)
 addEventHandler('mtax:admin:requestToggle', root, function()
 	local admin = client
 	if not isAdmin(admin) then
-		if outputChatBox then outputChatBox('You do not have permission to open the admin panel.', admin) end
+		pcall(function() exports['chat']:outputChatBox('You do not have permission to open the admin panel.', admin) end)
 		return
 	end
 	local nowOpen = not PanelOpen[admin]
@@ -903,12 +937,9 @@ for _, action in ipairs(NUI_ACTIONS) do
 end
 
 
-addEventHandler('onPlayerConnect', root, function(_, ip)
-	if not DB then return end
-	if isIpBanned(ip) or isSerialBanned(getPlayerSerial(source)) then
-		cancelEvent(true, 'You are banned from this server.')
-	end
-end)
+-- Ban enforcement at connect time is owned by the `bans` resource, which reads the
+-- player's identifiers (serial included) directly from the connection event. The panel
+-- intentionally does not enforce bans here to avoid a second, divergent check.
 
 local function logOnlineCount()
 	local online = #getElementsByType('player')
@@ -936,13 +967,9 @@ addEventHandler('onPlayerQuit', root, function()
 end)
 
 addEventHandler('onResourceStart', resourceRoot, function()
+	-- The panel's own database only stores panel settings (e.g. the server password).
+	-- Bans live in the authoritative `bans` resource.
 	DB = dbConnect('sqlite', Config.Database)
-	dbExec(DB, [[
-		CREATE TABLE IF NOT EXISTS bans (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT, ip TEXT, serial TEXT, reason TEXT, admin TEXT, date TEXT
-		)
-	]])
 	dbExec(DB, 'CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT)')
 
 	for _, p in ipairs(getElementsByType('player')) do
